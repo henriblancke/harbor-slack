@@ -143,6 +143,36 @@ const payloadNoTag = `{
   }
 }`
 
+// newMockHarborAPI returns a test server that responds to Harbor API project and artifact calls.
+func newMockHarborAPI() *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/api/v2.0/projects/") && strings.Contains(r.URL.Path, "/repositories/") {
+			json.NewEncoder(w).Encode(map[string]any{
+				"digest": "sha256:abc123",
+				"tags":   []map[string]string{{"name": "v1.2.3"}, {"name": "latest"}},
+			})
+			return
+		}
+		if strings.Contains(r.URL.Path, "/api/v2.0/projects/") {
+			json.NewEncoder(w).Encode(map[string]any{"project_id": 8, "name": "myproject"})
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+}
+
+func testConfig(slackURL, harborURL string) Config {
+	return Config{
+		SlackWebhookURL: slackURL,
+		HarborBaseURL:   harborURL,
+		HarborUsername:  "admin",
+		HarborPassword:  "test",
+		MinSeverity:     "Low",
+		Port:            "8080",
+		Harbor:          NewHarborClient(harborURL, "admin", "test"),
+	}
+}
+
 func TestMeetsThreshold(t *testing.T) {
 	tests := []struct {
 		severity    string
@@ -169,31 +199,37 @@ func TestMeetsThreshold(t *testing.T) {
 func TestImageRef(t *testing.T) {
 	repo := Repository{RepoFullName: "myproject/myapp"}
 
-	// With tag
-	res := Resource{Tag: "v1.2.3", Digest: "sha256:abc123"}
+	res := Resource{Digest: "sha256:954b378c375d852eb3c63ab88978f640b4348b01c1b3456a024a81536dafbbf4"}
 	got := imageRef(repo, res)
-	if got != "myproject/myapp:v1.2.3" {
-		t.Errorf("imageRef with tag = %q, want %q", got, "myproject/myapp:v1.2.3")
+	want := "myproject/myapp@sha256:954b378c375d"
+	if got != want {
+		t.Errorf("imageRef = %q, want %q", got, want)
+	}
+}
+
+func TestFormatTags(t *testing.T) {
+	got := formatTags([]string{"v1.2.3", "latest"})
+	want := "`v1.2.3`  `latest`"
+	if got != want {
+		t.Errorf("formatTags = %q, want %q", got, want)
 	}
 
-	// Without tag — falls back to short digest
-	res = Resource{Tag: "", Digest: "sha256:954b378c375d852eb3c63ab88978f640b4348b01c1b3456a024a81536dafbbf4"}
-	got = imageRef(repo, res)
-	if got != "myproject/myapp:sha256:954b378c375d" {
-		t.Errorf("imageRef without tag = %q, want %q", got, "myproject/myapp:sha256:954b378c375d")
+	got = formatTags(nil)
+	if got != "_no tags_" {
+		t.Errorf("formatTags(nil) = %q, want %q", got, "_no tags_")
 	}
 }
 
 func TestHarborLink(t *testing.T) {
 	repo := Repository{Name: "myapp", Namespace: "myproject"}
-	got := harborLink("https://harbor.example.com", repo, "sha256:abc123")
-	want := "https://harbor.example.com/harbor/projects/myproject/repositories/myapp/artifacts/sha256:abc123"
+	got := harborLink("https://harbor.example.com", 8, repo, "sha256:abc123")
+	want := "https://harbor.example.com/harbor/projects/8/repositories/myapp/artifacts-tab/artifacts/sha256:abc123?sbomDigest="
 	if got != want {
 		t.Errorf("harborLink = %q, want %q", got, want)
 	}
 
 	// Trailing slash in base URL
-	got = harborLink("https://harbor.example.com/", repo, "sha256:abc123")
+	got = harborLink("https://harbor.example.com/", 8, repo, "sha256:abc123")
 	if got != want {
 		t.Errorf("harborLink with trailing slash = %q, want %q", got, want)
 	}
@@ -215,7 +251,7 @@ func TestBuildSlackMessage(t *testing.T) {
 		Scanner: Scanner{Name: "Trivy", Version: "v0.37.2"},
 	}
 
-	msg := buildSlackMessage("myproject/myapp:v1.2.3", "https://harbor.example.com/link", report)
+	msg := buildSlackMessage("myproject/myapp@sha256:abc123", "https://harbor.example.com/link", "", []string{"v1.2.3"}, report)
 
 	// Verify it's valid JSON
 	_, err := json.Marshal(msg)
@@ -244,12 +280,10 @@ func TestWebhookHandler_Vulnerabilities(t *testing.T) {
 	}))
 	defer slackServer.Close()
 
-	cfg := Config{
-		SlackWebhookURL: slackServer.URL,
-		HarborBaseURL:   "https://harbor.example.com",
-		MinSeverity:     "Low",
-		Port:            "8080",
-	}
+	harborAPI := newMockHarborAPI()
+	defer harborAPI.Close()
+
+	cfg := testConfig(slackServer.URL, harborAPI.URL)
 
 	handler := handleWebhook(cfg)
 	req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(payloadWithVulnerabilities))
@@ -273,12 +307,10 @@ func TestWebhookHandler_CleanImage(t *testing.T) {
 	}))
 	defer slackServer.Close()
 
-	cfg := Config{
-		SlackWebhookURL: slackServer.URL,
-		HarborBaseURL:   "https://harbor.example.com",
-		MinSeverity:     "Low",
-		Port:            "8080",
-	}
+	harborAPI := newMockHarborAPI()
+	defer harborAPI.Close()
+
+	cfg := testConfig(slackServer.URL, harborAPI.URL)
 
 	handler := handleWebhook(cfg)
 	req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(payloadClean))
@@ -302,12 +334,11 @@ func TestWebhookHandler_BelowThreshold(t *testing.T) {
 	}))
 	defer slackServer.Close()
 
-	cfg := Config{
-		SlackWebhookURL: slackServer.URL,
-		HarborBaseURL:   "https://harbor.example.com",
-		MinSeverity:     "Critical",
-		Port:            "8080",
-	}
+	harborAPI := newMockHarborAPI()
+	defer harborAPI.Close()
+
+	cfg := testConfig(slackServer.URL, harborAPI.URL)
+	cfg.MinSeverity = "Critical"
 
 	handler := handleWebhook(cfg)
 	// This payload has severity "High" which is below "Critical" threshold
@@ -355,12 +386,10 @@ func TestWebhookHandler_ScanFailed(t *testing.T) {
 	}))
 	defer slackServer.Close()
 
-	cfg := Config{
-		SlackWebhookURL: slackServer.URL,
-		HarborBaseURL:   "https://harbor.example.com",
-		MinSeverity:     "Low",
-		Port:            "8080",
-	}
+	harborAPI := newMockHarborAPI()
+	defer harborAPI.Close()
+
+	cfg := testConfig(slackServer.URL, harborAPI.URL)
 
 	handler := handleWebhook(cfg)
 	req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(payload))
@@ -386,7 +415,7 @@ func TestWebhookHandler_ScanFailed(t *testing.T) {
 }
 
 func TestBuildSlackFailedMessage(t *testing.T) {
-	msg := buildSlackFailedMessage("myproject/broken:v2.0.0", "https://harbor.example.com/link", "Vulnerability Scan")
+	msg := buildSlackFailedMessage("myproject/broken@sha256:abc123", "https://harbor.example.com/link", "", []string{"v2.0.0"}, "Vulnerability Scan")
 
 	_, err := json.Marshal(msg)
 	if err != nil {
@@ -433,12 +462,10 @@ func TestWebhookHandler_SbomCompleted_Ignored(t *testing.T) {
 	}))
 	defer slackServer.Close()
 
-	cfg := Config{
-		SlackWebhookURL: slackServer.URL,
-		HarborBaseURL:   "https://harbor.example.com",
-		MinSeverity:     "Low",
-		Port:            "8080",
-	}
+	harborAPI := newMockHarborAPI()
+	defer harborAPI.Close()
+
+	cfg := testConfig(slackServer.URL, harborAPI.URL)
 
 	handler := handleWebhook(cfg)
 	req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(payload))
@@ -486,12 +513,10 @@ func TestWebhookHandler_SbomFailed(t *testing.T) {
 	}))
 	defer slackServer.Close()
 
-	cfg := Config{
-		SlackWebhookURL: slackServer.URL,
-		HarborBaseURL:   "https://harbor.example.com",
-		MinSeverity:     "Low",
-		Port:            "8080",
-	}
+	harborAPI := newMockHarborAPI()
+	defer harborAPI.Close()
+
+	cfg := testConfig(slackServer.URL, harborAPI.URL)
 
 	handler := handleWebhook(cfg)
 	req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(payload))
@@ -510,12 +535,10 @@ func TestWebhookHandler_SbomFailed(t *testing.T) {
 func TestWebhookHandler_NonScanEvent(t *testing.T) {
 	payload := `{"type": "PUSH_ARTIFACT", "event_data": {}}`
 
-	cfg := Config{
-		SlackWebhookURL: "http://unused",
-		HarborBaseURL:   "https://harbor.example.com",
-		MinSeverity:     "Low",
-		Port:            "8080",
-	}
+	harborAPI := newMockHarborAPI()
+	defer harborAPI.Close()
+
+	cfg := testConfig("http://unused", harborAPI.URL)
 
 	handler := handleWebhook(cfg)
 	req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(payload))

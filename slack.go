@@ -6,7 +6,10 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 )
+
+var slackHTTPClient = &http.Client{Timeout: 10 * time.Second}
 
 var severityEmoji = map[string]string{
 	"Critical": "\U0001f534", // red circle
@@ -31,7 +34,8 @@ func buildBar(count, maxCount int) string {
 }
 
 // buildSlackMessage constructs a Slack Block Kit message for a vulnerability report.
-func buildSlackMessage(imageRef, harborLink string, report *ScanReport) map[string]any {
+// parentLink is optional — when non-empty, a second button linking to the parent manifest is added.
+func buildSlackMessage(imageRef, harborLink, parentLink string, tags []string, report *ScanReport) map[string]any {
 	emoji := severityEmoji[report.Severity]
 	if emoji == "" {
 		emoji = "\u2139\ufe0f" // info
@@ -77,7 +81,7 @@ func buildSlackMessage(imageRef, harborLink string, report *ScanReport) map[stri
 			"type": "section",
 			"text": map[string]any{
 				"type": "mrkdwn",
-				"text": fmt.Sprintf("*%s*", imageRef),
+				"text": fmt.Sprintf("*%s*\n%s", imageRef, formatTags(tags)),
 			},
 		},
 		{
@@ -104,10 +108,10 @@ func buildSlackMessage(imageRef, harborLink string, report *ScanReport) map[stri
 					"type": "button",
 					"text": map[string]any{
 						"type":  "plain_text",
-						"text":  "View in Harbor",
+						"text":  "View in registry",
 						"emoji": true,
 					},
-					"url": harborLink,
+					"url": resolveLink(harborLink, parentLink),
 				},
 			},
 		},
@@ -117,7 +121,7 @@ func buildSlackMessage(imageRef, harborLink string, report *ScanReport) map[stri
 }
 
 // buildSlackFailedMessage constructs a Slack Block Kit message for a failed scan.
-func buildSlackFailedMessage(imageRef, harborLink, label string) map[string]any {
+func buildSlackFailedMessage(imageRef, harborLink, parentLink string, tags []string, label string) map[string]any {
 	blocks := []map[string]any{
 		{
 			"type": "header",
@@ -131,7 +135,7 @@ func buildSlackFailedMessage(imageRef, harborLink, label string) map[string]any 
 			"type": "section",
 			"text": map[string]any{
 				"type": "mrkdwn",
-				"text": fmt.Sprintf("*%s*\n\n%s did not complete successfully. Check Harbor for details.", imageRef, label),
+				"text": fmt.Sprintf("*%s*\n%s\n\n%s did not complete successfully. Check Harbor for details.", imageRef, formatTags(tags), label),
 			},
 		},
 		{
@@ -144,16 +148,24 @@ func buildSlackFailedMessage(imageRef, harborLink, label string) map[string]any 
 					"type": "button",
 					"text": map[string]any{
 						"type":  "plain_text",
-						"text":  "View in Harbor",
+						"text":  "View in registry",
 						"emoji": true,
 					},
-					"url": harborLink,
+					"url": resolveLink(harborLink, parentLink),
 				},
 			},
 		},
 	}
 
 	return map[string]any{"blocks": blocks}
+}
+
+// resolveLink returns the parent link if available, otherwise the artifact link.
+func resolveLink(harborLink, parentLink string) string {
+	if parentLink != "" {
+		return parentLink
+	}
+	return harborLink
 }
 
 // sendSlackMessage posts a message to a Slack webhook URL.
@@ -163,7 +175,7 @@ func sendSlackMessage(webhookURL string, message map[string]any) error {
 		return fmt.Errorf("marshal slack message: %w", err)
 	}
 
-	resp, err := http.Post(webhookURL, "application/json", bytes.NewReader(body))
+	resp, err := slackHTTPClient.Post(webhookURL, "application/json", bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("post to slack: %w", err)
 	}

@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 )
 
@@ -74,6 +76,7 @@ type Repository struct {
 
 // parseScanReport extracts the first scan report from the scan_overview map.
 // The key is a MIME type like "application/vnd.security.vulnerability.report; version=1.1".
+// NOTE: Harbor currently sends a single entry; if multiple keys exist, one is returned arbitrarily.
 func parseScanReport(overview map[string]json.RawMessage) (*ScanReport, error) {
 	for _, raw := range overview {
 		var report ScanReport
@@ -90,33 +93,54 @@ func meetsThreshold(severity, minSeverity string) bool {
 	return severityRank[severity] >= severityRank[minSeverity]
 }
 
-// imageRef returns a human-readable image reference, falling back to short digest if tag is empty.
+// imageRef returns a human-readable image reference using the short digest.
 func imageRef(repo Repository, resource Resource) string {
-	tag := resource.Tag
-	if tag == "" {
-		// Fall back to short digest
-		digest := resource.Digest
-		if strings.HasPrefix(digest, "sha256:") && len(digest) > 19 {
-			tag = digest[:19] // "sha256:" + 12 chars
-		} else {
-			tag = digest
-		}
+	digest := resource.Digest
+	if strings.HasPrefix(digest, "sha256:") && len(digest) > 19 {
+		digest = digest[:19] // "sha256:" + 12 chars
 	}
-	return fmt.Sprintf("%s:%s", repo.RepoFullName, tag)
+	return fmt.Sprintf("%s@%s", repo.RepoFullName, digest)
 }
 
-// harborLink builds a URL to the artifact in the Harbor UI.
-func harborLink(baseURL string, repo Repository, digest string) string {
+// formatTags returns a display string for tags.
+func formatTags(tags []string) string {
+	if len(tags) == 0 {
+		return "_no tags_"
+	}
+	formatted := make([]string, len(tags))
+	for i, t := range tags {
+		formatted[i] = "`" + t + "`"
+	}
+	return strings.Join(formatted, "  ")
+}
+
+// harborLink builds a URL to the artifact in the Harbor UI using the numeric project ID.
+func harborLink(baseURL string, projectID int, repo Repository, digest string) string {
 	baseURL = strings.TrimRight(baseURL, "/")
-	return fmt.Sprintf("%s/harbor/projects/%s/repositories/%s/artifacts/%s",
-		baseURL, repo.Namespace, repo.Name, digest)
+	return fmt.Sprintf("%s/harbor/projects/%d/repositories/%s/artifacts-tab/artifacts/%s?sbomDigest=",
+		baseURL, projectID, url.PathEscape(repo.Name), url.PathEscape(digest))
+}
+
+// lookupArtifact resolves the project ID, tags, and parent digest from the Harbor API.
+// On failure it falls back to zero values so messages still send.
+func lookupArtifact(cfg Config, repo Repository, digest string) (int, *ArtifactInfo) {
+	projectID, err := cfg.Harbor.GetProjectID(repo.Namespace)
+	if err != nil {
+		slog.Warn("harbor API get project", "error", err)
+	}
+	info, err := cfg.Harbor.GetArtifactInfo(repo.Namespace, repo.Name, digest)
+	if err != nil {
+		slog.Warn("harbor API get artifact info", "error", err)
+		info = &ArtifactInfo{}
+	}
+	return projectID, info
 }
 
 func handleScanCompleted(cfg Config, webhook HarborWebhook) {
 	for _, resource := range webhook.EventData.Resources {
 		report, err := parseScanReport(resource.ScanOverview)
 		if err != nil {
-			fmt.Printf("error parsing scan report: %v\n", err)
+			slog.Error("parsing scan report", "error", err)
 			continue
 		}
 
@@ -132,12 +156,17 @@ func handleScanCompleted(cfg Config, webhook HarborWebhook) {
 			continue
 		}
 
+		projectID, info := lookupArtifact(cfg, webhook.EventData.Repository, resource.Digest)
 		ref := imageRef(webhook.EventData.Repository, resource)
-		link := harborLink(cfg.HarborBaseURL, webhook.EventData.Repository, resource.Digest)
+		link := harborLink(cfg.HarborBaseURL, projectID, webhook.EventData.Repository, resource.Digest)
+		parentLink := ""
+		if info.ParentDigest != "" {
+			parentLink = harborLink(cfg.HarborBaseURL, projectID, webhook.EventData.Repository, info.ParentDigest)
+		}
 
-		msg := buildSlackMessage(ref, link, report)
+		msg := buildSlackMessage(ref, link, parentLink, info.Tags, report)
 		if err := sendSlackMessage(cfg.SlackWebhookURL, msg); err != nil {
-			fmt.Printf("error sending slack message: %v\n", err)
+			slog.Error("sending slack message", "error", err)
 		}
 	}
 }
@@ -149,12 +178,17 @@ func handleScanFailed(cfg Config, webhook HarborWebhook, scanType string) {
 	}
 
 	for _, resource := range webhook.EventData.Resources {
+		projectID, info := lookupArtifact(cfg, webhook.EventData.Repository, resource.Digest)
 		ref := imageRef(webhook.EventData.Repository, resource)
-		link := harborLink(cfg.HarborBaseURL, webhook.EventData.Repository, resource.Digest)
+		link := harborLink(cfg.HarborBaseURL, projectID, webhook.EventData.Repository, resource.Digest)
+		parentLink := ""
+		if info.ParentDigest != "" {
+			parentLink = harborLink(cfg.HarborBaseURL, projectID, webhook.EventData.Repository, info.ParentDigest)
+		}
 
-		msg := buildSlackFailedMessage(ref, link, label)
+		msg := buildSlackFailedMessage(ref, link, parentLink, info.Tags, label)
 		if err := sendSlackMessage(cfg.SlackWebhookURL, msg); err != nil {
-			fmt.Printf("error sending slack message: %v\n", err)
+			slog.Error("sending slack message", "error", err)
 		}
 	}
 }
@@ -167,12 +201,14 @@ func handleWebhook(cfg Config) http.HandlerFunc {
 			return
 		}
 
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1 MB
+		defer r.Body.Close()
+
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
 			http.Error(w, "failed to read body", http.StatusBadRequest)
 			return
 		}
-		defer r.Body.Close()
 
 		var webhook HarborWebhook
 		if err := json.Unmarshal(body, &webhook); err != nil {
