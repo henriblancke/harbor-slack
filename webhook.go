@@ -157,6 +157,27 @@ func handleScanCompleted(cfg Config, webhook HarborWebhook) {
 		}
 
 		projectID, info := lookupArtifact(cfg, webhook.EventData.Repository, resource.Digest)
+
+		if !info.ShouldNotify {
+			slog.Info("skipping non-winner multi-arch digest",
+				"digest", resource.Digest,
+				"repo", webhook.EventData.Repository.RepoFullName)
+			continue
+		}
+
+		// Dedup key: use parent digest when available so all children of the
+		// same manifest list share one key; fall back to the digest itself.
+		dedupKey := webhook.EventData.Repository.RepoFullName + "@" + resource.Digest
+		if info.ParentDigest != "" {
+			dedupKey = webhook.EventData.Repository.RepoFullName + "@" + info.ParentDigest
+		}
+		if cfg.Dedup.seen(dedupKey) {
+			slog.Info("skipping already-notified digest",
+				"digest", resource.Digest,
+				"repo", webhook.EventData.Repository.RepoFullName)
+			continue
+		}
+
 		ref := imageRef(webhook.EventData.Repository, resource)
 		link := harborLink(cfg.HarborBaseURL, projectID, webhook.EventData.Repository, resource.Digest)
 		parentLink := ""

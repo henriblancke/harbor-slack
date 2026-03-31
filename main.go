@@ -20,6 +20,7 @@ type Config struct {
 	MinSeverity     string
 	Port            string
 	Harbor          *HarborClient
+	Dedup           *dedupCache
 }
 
 func loadConfig() (Config, error) {
@@ -49,6 +50,7 @@ func loadConfig() (Config, error) {
 		return cfg, fmt.Errorf("HARBOR_PASSWORD is required")
 	}
 	cfg.Harbor = NewHarborClient(cfg.HarborAPIURL, cfg.HarborUsername, cfg.HarborPassword)
+	cfg.Dedup = newDedupCache(10 * time.Minute)
 	if cfg.MinSeverity == "" {
 		cfg.MinSeverity = "Low"
 	}

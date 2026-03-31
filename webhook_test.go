@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 const payloadWithVulnerabilities = `{
@@ -144,6 +145,7 @@ const payloadNoTag = `{
 }`
 
 // newMockHarborAPI returns a test server that responds to Harbor API project and artifact calls.
+// Single-arch artifacts get tags directly. Use newMockHarborAPIMultiArch for multi-arch scenarios.
 func newMockHarborAPI() *httptest.Server {
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, "/api/v2.0/projects/") && strings.Contains(r.URL.Path, "/repositories/") {
@@ -161,6 +163,48 @@ func newMockHarborAPI() *httptest.Server {
 	}))
 }
 
+// newMockHarborAPIMultiArch returns a test server that simulates multi-arch images.
+// Child digests have no tags; the parent manifest list has tags and references.
+func newMockHarborAPIMultiArch(childDigestAmd64, childDigestArm64 string) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		query := r.URL.RawQuery
+
+		// Project lookup
+		if strings.Contains(path, "/api/v2.0/projects/") && !strings.Contains(path, "/repositories/") {
+			json.NewEncoder(w).Encode(map[string]any{"project_id": 8, "name": "myproject"})
+			return
+		}
+
+		// List artifacts (parent search) — returns only tagged artifacts due to q=tags=*
+		if strings.Contains(path, "/repositories/") && strings.Contains(path, "/artifacts") &&
+			!strings.Contains(path, "sha256") && strings.Contains(query, "tags") {
+			json.NewEncoder(w).Encode([]map[string]any{
+				{
+					"digest": "sha256:parentaaa",
+					"tags":   []map[string]string{{"name": "v1.2.3"}},
+					"references": []map[string]string{
+						{"child_digest": childDigestAmd64},
+						{"child_digest": childDigestArm64},
+					},
+				},
+			})
+			return
+		}
+
+		// Single artifact lookup — child has no tags
+		if strings.Contains(path, "/artifacts/") {
+			json.NewEncoder(w).Encode(map[string]any{
+				"digest": strings.TrimPrefix(path[strings.LastIndex(path, "/artifacts/")+11:], ""),
+				"tags":   nil,
+			})
+			return
+		}
+
+		w.WriteHeader(http.StatusNotFound)
+	}))
+}
+
 func testConfig(slackURL, harborURL string) Config {
 	return Config{
 		SlackWebhookURL: slackURL,
@@ -170,6 +214,7 @@ func testConfig(slackURL, harborURL string) Config {
 		MinSeverity:     "Low",
 		Port:            "8080",
 		Harbor:          NewHarborClient(harborURL, "admin", "test"),
+		Dedup:           newDedupCache(10 * time.Minute),
 	}
 }
 
@@ -548,5 +593,169 @@ func TestWebhookHandler_NonScanEvent(t *testing.T) {
 
 	if w.Code != http.StatusOK {
 		t.Errorf("expected status 200, got %d", w.Code)
+	}
+}
+
+func multiArchPayload(digest string) string {
+	return `{
+  "type": "SCANNING_COMPLETED",
+  "occur_at": 1680502375,
+  "operator": "auto",
+  "event_data": {
+    "resources": [
+      {
+        "digest": "` + digest + `",
+        "tag": "",
+        "resource_url": "harbor.example.com/myproject/myapp@` + digest + `",
+        "scan_overview": {
+          "application/vnd.security.vulnerability.report; version=1.1": {
+            "report_id": "multi-arch-report",
+            "scan_status": "Success",
+            "severity": "Critical",
+            "duration": 5,
+            "summary": {
+              "total": 9,
+              "fixable": 9,
+              "summary": {
+                "Critical": 1,
+                "High": 5,
+                "Medium": 1,
+                "Low": 2
+              }
+            },
+            "start_time": "2023-04-03T06:12:47Z",
+            "end_time": "2023-04-03T06:12:52Z",
+            "scanner": {
+              "name": "Trivy",
+              "vendor": "Aqua Security",
+              "version": "v0.69.3"
+            },
+            "complete_percent": 100
+          }
+        }
+      }
+    ],
+    "repository": {
+      "name": "myapp",
+      "namespace": "myproject",
+      "repo_full_name": "myproject/myapp",
+      "repo_type": "private"
+    }
+  }
+}`
+}
+
+func TestWebhookHandler_MultiArch_SmallestDigestSends(t *testing.T) {
+	digestAmd64 := "sha256:1111111111111111" // lexicographically smaller
+	digestArm64 := "sha256:9999999999999999" // lexicographically larger
+
+	slackCalled := false
+	slackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		slackCalled = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer slackServer.Close()
+
+	harborAPI := newMockHarborAPIMultiArch(digestAmd64, digestArm64)
+	defer harborAPI.Close()
+
+	cfg := testConfig(slackServer.URL, harborAPI.URL)
+
+	// Webhook for the smallest digest — should send
+	handler := handleWebhook(cfg)
+	req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(multiArchPayload(digestAmd64)))
+	w := httptest.NewRecorder()
+	handler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", w.Code)
+	}
+	if !slackCalled {
+		t.Error("expected Slack message for smallest digest in multi-arch image")
+	}
+}
+
+func TestWebhookHandler_MultiArch_LargerDigestSkipped(t *testing.T) {
+	digestAmd64 := "sha256:1111111111111111" // lexicographically smaller
+	digestArm64 := "sha256:9999999999999999" // lexicographically larger
+
+	slackCalled := false
+	slackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		slackCalled = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer slackServer.Close()
+
+	harborAPI := newMockHarborAPIMultiArch(digestAmd64, digestArm64)
+	defer harborAPI.Close()
+
+	cfg := testConfig(slackServer.URL, harborAPI.URL)
+
+	// Webhook for the larger digest — should skip
+	handler := handleWebhook(cfg)
+	req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(multiArchPayload(digestArm64)))
+	w := httptest.NewRecorder()
+	handler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", w.Code)
+	}
+	if slackCalled {
+		t.Error("expected no Slack message for non-smallest digest in multi-arch image")
+	}
+}
+
+func TestIsSmallestDigest(t *testing.T) {
+	refs := []HarborReference{
+		{ChildDigest: "sha256:bbb"},
+		{ChildDigest: "sha256:aaa"},
+		{ChildDigest: "sha256:ccc"},
+	}
+
+	if !isSmallestDigest("sha256:aaa", refs) {
+		t.Error("sha256:aaa should be the smallest")
+	}
+	if isSmallestDigest("sha256:bbb", refs) {
+		t.Error("sha256:bbb should not be the smallest")
+	}
+	if isSmallestDigest("sha256:ccc", refs) {
+		t.Error("sha256:ccc should not be the smallest")
+	}
+
+	// Single child — always the winner
+	single := []HarborReference{{ChildDigest: "sha256:only"}}
+	if !isSmallestDigest("sha256:only", single) {
+		t.Error("single child should always be the smallest")
+	}
+}
+
+func TestWebhookHandler_SameDigestDedup(t *testing.T) {
+	slackCount := 0
+	slackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		slackCount++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer slackServer.Close()
+
+	harborAPI := newMockHarborAPI()
+	defer harborAPI.Close()
+
+	cfg := testConfig(slackServer.URL, harborAPI.URL)
+
+	handler := handleWebhook(cfg)
+
+	// Send the same webhook 3 times (simulating Harbor retries)
+	for i := 0; i < 3; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(payloadWithVulnerabilities))
+		w := httptest.NewRecorder()
+		handler(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Errorf("request %d: expected status 200, got %d", i, w.Code)
+		}
+	}
+
+	if slackCount != 1 {
+		t.Errorf("expected 1 Slack message, got %d", slackCount)
 	}
 }

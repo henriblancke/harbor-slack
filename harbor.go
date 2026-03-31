@@ -96,8 +96,8 @@ func (c *HarborClient) getArtifact(projectName, repoName, digest string) (*Harbo
 
 // listArtifacts lists all artifacts in a repository with tags.
 func (c *HarborClient) listArtifacts(projectName, repoName string) ([]HarborArtifact, error) {
-	url := fmt.Sprintf("%s/api/v2.0/projects/%s/repositories/%s/artifacts?with_tag=true&page_size=100",
-		c.BaseURL, url.PathEscape(projectName), url.PathEscape(repoName))
+	url := fmt.Sprintf("%s/api/v2.0/projects/%s/repositories/%s/artifacts?with_tag=true&page_size=100&q=%s",
+		c.BaseURL, url.PathEscape(projectName), url.PathEscape(repoName), url.QueryEscape("tags=*"))
 	resp, err := c.do(url)
 	if err != nil {
 		return nil, fmt.Errorf("list artifacts: %w", err)
@@ -119,6 +119,11 @@ func (c *HarborClient) listArtifacts(projectName, repoName string) ([]HarborArti
 type ArtifactInfo struct {
 	Tags         []string
 	ParentDigest string // non-empty when tags came from a parent manifest list
+	// ShouldNotify is true when this digest should send a notification.
+	// For multi-arch images only the lexicographically smallest child digest
+	// sends, so all pods deterministically agree without shared state.
+	// Always true for single-arch images or when the parent cannot be resolved.
+	ShouldNotify bool
 }
 
 // GetArtifactInfo returns tag names and parent digest for an artifact identified by digest.
@@ -130,30 +135,47 @@ func (c *HarborClient) GetArtifactInfo(projectName, repoName, digest string) (*A
 		return nil, err
 	}
 
-	// If the artifact has tags directly, return them (no parent).
+	// If the artifact has tags directly, it's a single-arch image — always notify.
 	if len(artifact.Tags) > 0 {
-		return &ArtifactInfo{Tags: extractTags(artifact.Tags)}, nil
+		return &ArtifactInfo{Tags: extractTags(artifact.Tags), ShouldNotify: true}, nil
 	}
 
 	// No tags — this is likely a platform-specific manifest in a multi-arch image.
-	// Search for a parent manifest list that references this digest.
+	// Search for a tagged parent manifest list that references this digest.
 	artifacts, err := c.listArtifacts(projectName, repoName)
 	if err != nil {
 		return nil, fmt.Errorf("searching for parent manifest: %w", err)
 	}
 
 	for _, a := range artifacts {
+		if len(a.Tags) == 0 || len(a.References) == 0 {
+			continue
+		}
 		for _, ref := range a.References {
-			if ref.ChildDigest == digest && len(a.Tags) > 0 {
+			if ref.ChildDigest == digest {
 				return &ArtifactInfo{
 					Tags:         extractTags(a.Tags),
 					ParentDigest: a.Digest,
+					ShouldNotify: isSmallestDigest(digest, a.References),
 				}, nil
 			}
 		}
 	}
 
-	return &ArtifactInfo{}, nil
+	// No parent found — send anyway as a fallback.
+	return &ArtifactInfo{ShouldNotify: true}, nil
+}
+
+// isSmallestDigest returns true if digest is the lexicographically smallest
+// child digest in refs. This provides a deterministic way for all pods to
+// agree on which child sends the notification without shared state.
+func isSmallestDigest(digest string, refs []HarborReference) bool {
+	for _, ref := range refs {
+		if ref.ChildDigest < digest {
+			return false
+		}
+	}
+	return true
 }
 
 func extractTags(tags []HarborTag) []string {
